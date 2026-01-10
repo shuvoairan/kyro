@@ -9,6 +9,8 @@ from discord.ext import commands
 from .config import Settings
 from .logging_config import configure_logging
 
+from .db import Database
+
 settings = Settings()
 
 logger = logging.getLogger(__name__)
@@ -29,8 +31,19 @@ class MyBot(commands.Bot):
             intents=intents,
             **kwargs,
         )
+        
+    db: Database | None = None
+    settings: Settings        
 
     async def setup_hook(self) -> None:
+
+        # open DB connection before loading cogs
+        self.settings = settings
+        db_path = self.settings.__dict__.get("database_path") or "data/bot.db"
+        self.db = Database(db_path)
+        await self.db.connect()
+        await self.db.bootstrap()
+
         # Load cogs
         if COGS_PATH.is_dir():
             for file in sorted(COGS_PATH.glob("*.py")):
