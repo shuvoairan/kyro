@@ -9,11 +9,13 @@ from typing import Any, Iterable, Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    discord_id INTEGER NOT NULL UNIQUE,
+CREATE TABLE IF NOT EXISTS guild_members (
+    user_id INTEGER PRIMARY KEY,
     username TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now'))
+    nickname TEXT,
+    first_joined_at INTEGER NOT NULL,
+    last_joined_at INTEGER NOT NULL,
+    left_at INTEGER
 );
 """
 
