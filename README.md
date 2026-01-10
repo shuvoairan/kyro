@@ -1,12 +1,11 @@
 ```mermaid
 erDiagram
-    users {
-        bigint id PK
+    guild_members {
+        bigint user_id
         text username
         text nickname
-        text discord_id
-        int first_joined_at
-        int last_joined_at
-        int left_at
+        timestamp first_joined_at
+        timestamp last_joined_at
+        timestamp left_at
     }
 ```
