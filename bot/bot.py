@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib
 import logging
 from pathlib import Path
+from typing import Iterable
 
 from discord import Intents, Object
 from discord.ext import commands
@@ -16,6 +18,8 @@ settings = Settings()
 logger = logging.getLogger(__name__)
 
 COGS_PATH = Path(__file__).parent / "cogs"
+
+DEFAULT_COG_PACKAGES = []
 
 
 class MyBot(commands.Bot):
@@ -36,7 +40,6 @@ class MyBot(commands.Bot):
     settings: Settings
 
     async def setup_hook(self) -> None:
-
         # open DB connection before loading cogs
         self.settings = settings
         db_path = self.settings.__dict__.get("database_path") or "data/bot.db"
@@ -51,6 +54,30 @@ class MyBot(commands.Bot):
                     continue
 
                 module_path = f"bot.cogs.{file.stem}"
+                try:
+                    await self.load_extension(module_path)
+                    logger.info("Loaded extension %s", module_path)
+                except Exception:
+                    logger.exception("Failed to load extension %s", module_path)
+
+        # -------- Load selected cog subpackages (e.g. bot/cogs/mod/*.py) ----------
+        cog_packages = getattr(settings, "cog_packages", None) or DEFAULT_COG_PACKAGES
+        if not isinstance(cog_packages, (list, tuple)):
+            logger.warning("cog_packages setting is not iterable; ignoring")
+            cog_packages = []
+
+        for pkg in cog_packages:
+            pkg_dir = COGS_PATH / pkg
+            if not pkg_dir.is_dir():
+                logger.debug("Cog package %s not found at %s — skipping", pkg, pkg_dir)
+                continue
+
+            # Load all .py files inside package (except __init__.py)
+            for file in sorted(pkg_dir.glob("*.py")):
+                if file.name == "__init__.py":
+                    continue
+
+                module_path = f"bot.cogs.{pkg}.{file.stem}"
                 try:
                     await self.load_extension(module_path)
                     logger.info("Loaded extension %s", module_path)
