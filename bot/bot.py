@@ -31,9 +31,9 @@ class MyBot(commands.Bot):
             intents=intents,
             **kwargs,
         )
-        
+
     db: Database | None = None
-    settings: Settings        
+    settings: Settings
 
     async def setup_hook(self) -> None:
 
