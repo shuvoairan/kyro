@@ -17,7 +17,27 @@ CREATE TABLE IF NOT EXISTS guild_members (
     last_joined_at INTEGER NOT NULL,
     left_at INTEGER
 );
+    
+CREATE TABLE IF NOT EXISTS moderation_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL,
+    target_id INTEGER NOT NULL,
+    target_name TEXT NOT NULL,
+    moderator_id INTEGER NOT NULL,
+    moderator_name TEXT NOT NULL,
+    reason TEXT,
+    timestamp INTEGER NOT NULL,
+    success INTEGER NOT NULL,
+    note TEXT
+);
 """
+
+_INSERT_MOD_LOG_SQL = """
+INSERT INTO moderation_logs
+(action, target_id, target_name, moderator_id, moderator_name, reason, timestamp, success, note)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
 
 class Database:
     def __init__(self, path: str | Path) -> None:
@@ -44,20 +64,30 @@ class Database:
         return self._conn
 
     async def bootstrap(self, schema_sql: str = DEFAULT_SCHEMA) -> None:
+        """Create DB schema (gets called on every startup)."""
         logger.info("Bootstrapping DB schema")
         conn = self._ensure_conn()
         await conn.executescript(schema_sql)
         await conn.commit()
         logger.info("DB schema bootstrapped")
 
-    async def execute(self, sql: str, params: Optional[Iterable[Any]] = None) -> None:
+    async def execute(self, sql: str, params: Optional[Iterable[Any]] = None) -> Optional[int]:
         conn = self._ensure_conn()
-        await conn.execute(sql, params or [])
-        await conn.commit()
+        async with conn.execute(sql, tuple(params or [])) as cur:
+            await conn.commit()
+            try:
+                return cur.lastrowid
+            except AttributeError:
+                return None
 
     async def fetchone(self, sql: str, params: Optional[Iterable[Any]] = None) -> Optional[aiosqlite.Row]:
         conn = self._ensure_conn()
-        cur = await conn.execute(sql, params or [])
-        row = await cur.fetchone()
-        await cur.close()
-        return row
+        async with conn.execute(sql, tuple(params or [])) as cur:
+            row = await cur.fetchone()
+            return row
+
+    async def fetchall(self, sql: str, params: Optional[Iterable[Any]] = None) -> List[aiosqlite.Row]:
+        conn = self._ensure_conn()
+        async with conn.execute(sql, tuple(params or [])) as cur:
+            rows = await cur.fetchall()
+            return rows

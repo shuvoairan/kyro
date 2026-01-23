@@ -13,7 +13,6 @@ from .logging_config import configure_logging
 
 from .db import Database
 
-settings = Settings()
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +40,8 @@ class MyBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         # open DB connection before loading cogs
-        self.settings = settings
-        db_path = self.settings.__dict__.get("database_path") or "data/bot.db"
+        settings = self.settings
+        db_path = settings.database_path or "data/bot.db"
         self.db = Database(db_path)
         await self.db.connect()
         await self.db.bootstrap()
@@ -94,11 +93,20 @@ class MyBot(commands.Bot):
             await self.tree.sync()
             logger.info("Synced global commands")
 
+    async def close(self) -> None:
+        try:
+            if self.db:
+                await self.db.close()
+        finally:
+            await super().close()
+
     async def on_ready(self) -> None:
         logger.info("%s is online (id=%s)", self.user, self.user.id)
 
 
-def create_bot() -> MyBot:
+def create_bot(settings: Settings | None = None) -> MyBot:
+    if settings is None:
+        settings = Settings()
     configure_logging(settings.debug)
 
     intents = Intents.default()
@@ -106,14 +114,17 @@ def create_bot() -> MyBot:
     intents.messages = True
     intents.message_content = True
 
-    return MyBot(intents=intents)
+    bot = MyBot(intents=intents)
+    bot.settings = settings
+    return bot
 
 
-def run_bot() -> None:
+def run_bot(settings: Settings | None = None) -> None:
+    setings = settings or Settings()
     if not settings.token:
         raise RuntimeError("TOKEN is not set in environment (.env)")
 
-    bot = create_bot()
+    bot = create_bot(settings=settings)
     try:
         bot.run(settings.token)
     except Exception:

@@ -8,6 +8,10 @@ class Settings(BaseSettings):
     debug: bool = False
     database_path: str = "data/bot.db"
 
+    mod_role_id: int = None
+    mod_log_channel_id: Optional[int] = None
+
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
