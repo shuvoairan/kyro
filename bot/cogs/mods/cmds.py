@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import discord
@@ -13,6 +13,28 @@ from discord.ui import View, button, Button
 from bot.services.mod_logging import log_moderation_action
 
 logger = logging.getLogger(__name__)
+
+TIMEOUT_CHOICES = [
+    app_commands.Choice(name="60 seconds", value="60s"),
+    app_commands.Choice(name="1 minute", value="1m"),
+    app_commands.Choice(name="10 minutes", value="10m"),
+    app_commands.Choice(name="1 hour", value="1h"),
+    app_commands.Choice(name="1 day", value="1d"),
+    app_commands.Choice(name="1 week", value="1w"),
+    app_commands.Choice(name="14 days", value="14d"),
+    app_commands.Choice(name="28 days", value="28d"),
+]
+
+_DURATION_MAP = {
+    "60s": 60,
+    "1m": 60,
+    "10m": 10 * 60,
+    "1h": 60 * 60,
+    "1d": 24 * 60 * 60,
+    "1w": 7 * 24 * 60 * 60,
+    "14d": 14 * 24 * 60 * 60,
+    "28d": 28 * 24 * 60 * 60,
+}
 
 def parse_user_id(value: str) -> int:
     if value is None:
@@ -106,7 +128,7 @@ class ConfirmKickView(View):
             logger.exception("Unexpected error while kicking %s", target)
 
         try:
-            modlog_result = await log_moderation_action(
+             await log_moderation_action(
                 self.bot,
                 action="kick",
                 target_id=target.id,
@@ -121,7 +143,6 @@ class ConfirmKickView(View):
         except Exception as exc:
             # If the logging helper itself fails, record that for the moderator message
             logger.exception("log_moderation_action failed unexpectedly")
-            modlog_result = None
 
         # Build final message to moderator (ephemeral)
         parts = []
@@ -237,7 +258,7 @@ class ConfirmBanView(View):
             logger.exception("Unexpected error while kicking %s", target)
 
         try:
-            modlog_result = await log_moderation_action(
+            await log_moderation_action(
                 self.bot,
                 action="ban",
                 target_id=target.id,
@@ -251,7 +272,6 @@ class ConfirmBanView(View):
             )
         except Exception as exc:
             logger.exception("log_moderation_action failed for ban")
-            modlog_result = None
 
         # Build final message to moderator (ephemeral)
         parts = []
@@ -468,6 +488,126 @@ class ConfirmUnbanView(View):
         await interaction.response.edit_message(content="Unban cancelled.", view=self)
         await self._disable_all(interaction)
 
+class ConfirmTimeoutView(View):
+    def __init__(
+        self,
+        *,
+        invoker: discord.User,
+        target_member: discord.Member,
+        seconds: int,
+        reason: Optional[str],
+        bot: commands.Bot,
+        timeout: float = 60.0,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.invoker = invoker
+        self.target_member = target_member
+        self.seconds = seconds
+        self.reason = reason
+        self.bot = bot
+        self.result: Optional[dict] = None  # filled after confirm/cancel
+
+    async def _disable_all(self, interaction: Optional[Interaction] = None) -> None:
+        # Disable all buttons and attempt to edit the original response to reflect disabled UI
+        for child in self.children:
+            if isinstance(child, Button):
+                child.disabled = True
+        if interaction is not None:
+            try:
+                # edit original response
+                await interaction.edit_original_response(view=self)
+            except Exception:
+                logger.debug("Failed to edit original response while disabling UI", exc_info=True)
+
+    @button(label="Confirm timeout", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: Interaction, button_: Button) -> None:
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the user who invoked the command can confirm this action.",
+                ephemeral=True,
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Applying timeout...",view=self)
+
+        moderator = interaction.user
+        target = self.target_member
+        seconds = int(self.seconds)
+        until = datetime.utcnow() + timedelta(seconds=seconds)
+        ts = int(datetime.utcnow().timestamp())
+
+        success = False
+        note: Optional[str] = None
+
+        try:
+            await target.timeout(timedelta(seconds=seconds), reason=f"{self.reason} - moderator:{moderator} ({moderator.id})")
+            success = True
+        except discord.Forbidden:
+            success = False
+            note = "Missing permissions or role hierarchy prevents timeout (Forbidden)."
+            logger.warning("Timeout forbidden: moderator=%s target=%s", moderator, target)
+        except discord.NotFound:
+            success = False
+            note = "Member not found (may have left)."
+            logger.info("Timeout attempted but member not found: %s", target)
+        except discord.HTTPException as exc:
+            success = False
+            note = f"Discord API error during timeout: {exc!r}"
+            logger.exception("HTTPException while applying timeout to %s", target)
+        except Exception as exc:
+            success = False
+            note = f"Unexpected error during timeout: {exc!r}"
+            logger.exception("Unexpected error while applying timeout to %s", target)
+
+        try:
+             await log_moderation_action(
+                self.bot,
+                action="timeout",
+                target_id=target.id if hasattr(target, "id") else None,
+                target_name=str(target),
+                moderator_id=moderator.id,
+                moderator_name=str(moderator),
+                reason=self.reason,
+                success=success,
+                note=f"Until = {until.replace(microsecond=0).isoformat()}" + (f"; {note}" if note else ""),
+                timestamp=ts,
+            )
+        except Exception:
+            logger.exception("log_moderation_action failed for timeout")
+
+        parts = []
+        if success:
+            parts.append(f"✅ Timed out {target.mention} until {until.replace(microsecond=0).isoformat()} (UTC)")
+        else:
+            parts.append(f"❌ Failed to timeout {target} - see log for details")
+
+        if note:
+            parts.append(f"Timeout: {note}")
+
+        final_content = "\n".join(parts)
+
+        try:
+            await interaction.followup.send(final_content, ephemeral=True)
+        except Exception:
+            try:
+                await interaction.edit_original_response(content=final_content, view=self)
+            except Exception:
+                logger.debug("Failed to send followup or edit original response for timeout confirmation", exc_info=True)
+
+        await self._disable_all(interaction)
+
+    @button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: Interaction, button_: Button) -> None:
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message("Only the user who invoked the command can cancel this action.", ephemeral=True)
+            return
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Timeout cancelled.", view=self)
+        await self._disable_all(interaction)
+
 
 class ModerationCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
@@ -628,6 +768,67 @@ class ModerationCog(commands.Cog):
         await interaction.response.send_message(
             f"Confirm unbanning user id `{uid}`? This action is irreversible.", view=view, ephemeral=True
         )
+
+    @app_commands.command(
+        name="timeout",
+        description="Apply timeout to a member (requires moderator role or Moderate Members permission)."
+    )
+    @app_commands.choices(duration=TIMEOUT_CHOICES)
+    @app_commands.describe(member="Member to timeout", duration="Choose a timeout duration", reason="Reason for the timeout (optional")
+    async def timeout(
+        self,
+        interaction: Interaction,
+        member: discord.Member,
+        duration: app_commands.Choice[str],
+        reason: Optional[str] = None) -> None:
+
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a guild.", ephemeral=True)
+            return
+
+        if not self._is_moderator(interaction):
+            await interaction.response.send_message("You do not have permission to run this command.", ephemeral=True)
+            return
+
+        # Prevent self-ban and bot-ban
+        if member.id == interaction.user.id:
+            await interaction.response.send_message("You cannot timeout yourself.", ephemeral=True)
+            return
+        if member.id == self.bot.user.id:
+            await interaction.response.send_message("I cannot timeout myself.", ephemeral=True)
+            return
+
+        # Role hierarchy check
+        try:
+            invoker_member = interaction.guild.get_member(interaction.user.id)
+            if invoker_member is None:
+                invoker_member = await interaction.guild.fetch_member(interaction.user.id)
+            # allow guild owner to bypass role ordering checks
+            if (
+                member.top_role >= invoker_member.top_role
+                and interaction.user.id != interaction.guild.owner_id
+            ):
+                await interaction.response.send_message(
+                    "You cannot timeout a member with an equal or higher role than you.", ephemeral=True
+                )
+                return
+        except Exception:
+            # If role check fails for some reason, continue but log it
+            logger.exception("Failed to check role hierarchy while attempting to timeout %s", member)
+
+        sec = _DURATION_MAP.get(duration.value, None)
+
+        if sec is None:
+            await interaction.response.send_message("Invalid duration choice.", ephemeral=True)
+            return
+
+        view = ConfirmTimeoutView(invoker=interaction.user, target_member=member, seconds=sec, reason=reason, bot=self.bot)
+        await interaction.response.send_message(f"Confirm applying a timeout to {member.mention} for {duration.name}?", view=view, ephemeral=True)
+
+
+
+
+
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(ModerationCog(bot))
