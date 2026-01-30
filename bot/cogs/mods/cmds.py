@@ -609,6 +609,122 @@ class ConfirmTimeoutView(View):
         await self._disable_all(interaction)
 
 
+class ConfirmUntimeoutView(View):
+    def __init__(
+        self,
+        *,
+        invoker: discord.User,
+        target_member: discord.Member,
+        reason: Optional[str],
+        bot: commands.Bot,
+        timeout: float = 60.0,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.invoker = invoker
+        self.target_member = target_member
+        self.reason = reason or "No reason provided"
+        self.bot = bot
+
+    async def _disable_all(self, interaction: Optional[Interaction] = None) -> None:
+        for child in self.children:
+            if isinstance(child, Button):
+                child.disabled = True
+        if interaction is not None:
+            try:
+                await interaction.edit_original_response(view=self)
+            except Exception:
+                logger.debug("Failed to edit original response while disabling UI (untimeout)", exc_info=True)
+
+    @button(label="Confirm remove timeout", style=discord.ButtonStyle.primary)
+    async def confirm(self, interaction: Interaction, button_: Button) -> None:
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message("Only the user who invoked the command can confirm this action.", ephemeral=True)
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Removing timeout…", view=self)
+
+        moderator = interaction.user
+        target = self.target_member
+        reason = self.reason
+        ts = int(datetime.utcnow().timestamp())
+
+        success = False
+        note: Optional[str] = None
+
+
+        try:
+            await target.edit(timed_out_until=None, reason=f"{reason} - moderator:{moderator} ({moderator.id})")
+            success = True
+            note = None
+        except discord.Forbidden:
+            success = False
+            note = "Missing permissions or role hierarchy prevents removing timeout (Forbidden)."
+            logger.warning("Untimeout forbidden: moderator=%s target=%s", moderator, target)
+        except discord.NotFound:
+            success = False
+            note = "Member not found (may have left)."
+            logger.info("Untimeout attempted but member not found: %s", target)
+        except discord.HTTPException as exc:
+            success = False
+            note = f"Discord API error during remove timeout: {exc!r}"
+            logger.exception("HTTPException while removing timeout from %s", target)
+
+        except Exception as exc:
+            success = False
+            note = f"Unexpected error during remove timeout: {exc!r}"
+            logger.exception("Unexpected error while removing timeout from %s", target)
+
+
+        try:
+             await log_moderation_action(
+                self.bot,
+                action="untimeout",
+                target_id=getattr(target, "id", None),
+                target_name=str(target),
+                moderator_id=moderator.id,
+                moderator_name=str(moderator),
+                reason=reason,
+                success=success,
+                note=(f"removed timeout" + (f"; {note}" if note else "")) if success or note else None,
+                timestamp=ts,
+            )
+        except Exception:
+            logger.exception("log_moderation_action failed for untimeout")
+            modlog_result = None
+
+        parts = []
+        if success:
+            parts.append(f"✅ Removed timeout from {target.mention}")
+        else:
+            parts.append(f"❌ Failed to remove timeout from {target} - see log for details")
+
+        if note:
+            parts.append(f"Untimeout: {note}")
+
+        final_content = "\n".join(parts)
+
+        try:
+            await interaction.followup.send(final_content, ephemeral=True)
+        except Exception:
+            try:
+                await interaction.edit_original_response(content=final_content, view=self)
+            except Exception:
+                logger.debug("Failed to send followup or edit original response for untimeout confirmation", exc_info=True)
+
+        await self._disable_all(interaction)
+
+    @button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: Interaction, button_: Button) -> None:
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message("Only the user who invoked the command can cancel this action.", ephemeral=True)
+            return
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Remove timeout cancelled.", view=self)
+        await self._disable_all(interaction)
+
 class ModerationCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -826,8 +942,41 @@ class ModerationCog(commands.Cog):
         await interaction.response.send_message(f"Confirm applying a timeout to {member.mention} for {duration.name}?", view=view, ephemeral=True)
 
 
+    @app_commands.command(
+        name="untimeout",
+        description="Remove a member's communication timeout (requires moderator role or Moderate Members permission)."
+    )
+    @app_commands.describe(member="Member to remove timeout from", reason="Reason (optional)")
+    async def untimeout(
+        self,
+        interaction: Interaction,
+        member: discord.Member,
+        reason: Optional[str] = None,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a guild.", ephemeral=True)
+            return
 
+        if not self._is_moderator(interaction):
+            await interaction.response.send_message("You do not have permission to run this command.", ephemeral=True)
+            return
 
+        if member.id == interaction.user.id:
+            await interaction.response.send_message("You cannot remove your own timeout.", ephemeral=True)
+            return
+        if member.id == self.bot.user.id:
+            await interaction.response.send_message("I cannot remove my own timeout.", ephemeral=True)
+            return
+
+        if member.timed_out_until is None:
+            await interaction.response.send_message(
+                f"❌ {member.mention} is not currently timed out!",
+                ephemeral=True
+            )
+            return
+
+        view = ConfirmUntimeoutView(invoker=interaction.user, target_member=member, reason=reason, bot=self.bot)
+        await interaction.response.send_message(f"Confirm removing timeout from {member.mention}?", view=view, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:
