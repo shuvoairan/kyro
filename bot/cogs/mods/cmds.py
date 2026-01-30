@@ -1049,5 +1049,74 @@ class ModerationCog(commands.Cog):
         if not interaction.response.is_done():
             await interaction.response.send_message(message, ephemeral=True)
 
+    @channel.command(name="unlock", description="Unlock a text channel (restores @everyone send messages override).")
+    @app_commands.describe(channel="Channel to unlock", reason="Reason for the unlock (optional)")
+    async def unlock(
+        self,
+        interaction: Interaction,
+        channel: Optional[TextChannel] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command must be used in a guild", ephemeral=True)
+            return
+
+        if not self._is_moderator(interaction):
+            await interaction.response.send_message("You do not have permission to run this command.", ephemeral=True)
+            return
+
+        target = channel or (interaction.channel if isinstance(interaction.channel, TextChannel) else None)
+
+        if target is None:
+            await interaction.response.send_message("Please specify a text channel.", ephemeral=True)
+            return
+
+        if not target.permissions_for(interaction.guild.me).manage_channels:
+            await interaction.response.send_message("I don't have Manage Channels permission for that channel.", ephemeral=True)
+            return
+
+        ts = int(datetime.utcnow().timestamp())
+
+        success = False
+        note: Optional[str] = None
+        try:
+            await channel.set_permissions(channel.guild.default_role, send_messages=True)
+            success = True
+        except discord.Forbidden:
+            note = "Missing permissions to edit channel overwrites (Forbidden)."
+            logger.warning("Unlock forbidden: %s %s", interaction.user, target)
+        except discord.HTTPException as exc:
+            note = f"Discord API error white unlocking channel: {exc!r}"
+            logger.exception("HTTPException while unlocking channel %s", target)
+
+        try:
+            await log_moderation_action(
+                self.bot,
+                action="channel_unlock",
+                target_id=target.id,
+                target_name=str(target),
+                moderator_id=interaction.user.id,
+                moderator_name=str(interaction.user),
+                reason=reason or "No reason provided",
+                success=success,
+                note=note,
+                timestamp=ts,
+            )
+        except Exception:
+            logger.exception("log_moderation_action failed for channel unlock")
+
+        parts = []
+        if success:
+            parts.append(f"✅ Unlocked {target.mention}")
+        else:
+            parts.append(f"❌ Failed to unlock {target} - see log for details")
+        if note:
+            parts.append(f"Note: {note}")
+
+        message = "\n".join(parts)
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=True)
+
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(ModerationCog(bot))
