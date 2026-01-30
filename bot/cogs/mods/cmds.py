@@ -6,7 +6,7 @@ from typing import Optional
 
 import discord
 import re
-from discord import app_commands, Interaction
+from discord import app_commands, Interaction, TextChannel
 from discord.ext import commands
 from discord.ui import View, button, Button
 
@@ -726,8 +726,10 @@ class ConfirmUntimeoutView(View):
         await self._disable_all(interaction)
 
 class ModerationCog(commands.Cog):
+    channel = app_commands.Group(name="channel", description="Channel moderation actions")
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
 
     def _is_moderator(self, interaction: Interaction) -> bool:
         # prefer a configured mod role; fallback to guild perm kick_members
@@ -978,6 +980,74 @@ class ModerationCog(commands.Cog):
         view = ConfirmUntimeoutView(invoker=interaction.user, target_member=member, reason=reason, bot=self.bot)
         await interaction.response.send_message(f"Confirm removing timeout from {member.mention}?", view=view, ephemeral=True)
 
+    @channel.command(name="lock", description="Lock a text channel (disables @everyone send messages).")
+    @app_commands.describe(channel="Channel to lock", reason="Reason for the lock (optional)")
+    async def lock(
+        self,
+        interaction: Interaction,
+        channel: Optional[TextChannel] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command must be used in a guild", ephemeral=True)
+            return
+
+        if not self._is_moderator(interaction):
+            await interaction.response.send_message("You do not have permission to run this command.", ephemeral=True)
+            return
+
+        target = channel or (interaction.channel if isinstance(interaction.channel, TextChannel) else None)
+
+        if target is None:
+            await interaction.response.send_message("Please specify a text channel.", ephemeral=True)
+            return
+
+        if not target.permissions_for(interaction.guild.me).manage_channels:
+            await interaction.response.send_message("I don't have Manage Channels permission for that channel.", ephemeral=True)
+            return
+
+        ts = int(datetime.utcnow().timestamp())
+
+        success = False
+        note: Optional[str] = None
+        try:
+            await channel.set_permissions(channel.guild.default_role, send_messages=False)
+            success = True
+        except discord.Forbidden:
+            note = "Missing permissions to edit channel overwrites (Forbidden)."
+            logger.warning("Lock forbidden: %s %s", interaction.user, target)
+        except discord.HTTPException as exc:
+            note = f"Discord API error white locking channel: {exc!r}"
+            logger.exception("HTTPException while locking channel %s", target)
+
+        try:
+            await log_moderation_action(
+                self.bot,
+                action="channel_lock",
+                target_id=target.id,
+                target_name=str(target),
+                moderator_id=interaction.user.id,
+                moderator_name=str(interaction.user),
+                reason=reason or "No reason provided",
+                success=success,
+                note=note,
+                timestamp=ts,
+            )
+        except Exception:
+            logger.exception("log_moderation_action failed for channel lock")
+
+        parts = []
+        if success:
+            parts.append(f"✅ Locked {target.mention}")
+        else:
+            parts.append(f"❌ Failed to lock {target} - see log for details")
+        if note:
+            parts.append(f"Note: {note}")
+
+        message = "\n".join(parts)
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=True)
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(ModerationCog(bot))
