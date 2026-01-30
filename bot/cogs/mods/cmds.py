@@ -1,0 +1,1122 @@
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta
+from typing import Optional
+
+import discord
+import re
+from discord import app_commands, Interaction, TextChannel
+from discord.ext import commands
+from discord.ui import View, button, Button
+
+from bot.services.mod_logging import log_moderation_action
+
+logger = logging.getLogger(__name__)
+
+TIMEOUT_CHOICES = [
+    app_commands.Choice(name="60 seconds", value="60s"),
+    app_commands.Choice(name="1 minute", value="1m"),
+    app_commands.Choice(name="10 minutes", value="10m"),
+    app_commands.Choice(name="1 hour", value="1h"),
+    app_commands.Choice(name="1 day", value="1d"),
+    app_commands.Choice(name="1 week", value="1w"),
+    app_commands.Choice(name="14 days", value="14d"),
+    app_commands.Choice(name="28 days", value="28d"),
+]
+
+_DURATION_MAP = {
+    "60s": 60,
+    "1m": 60,
+    "10m": 10 * 60,
+    "1h": 60 * 60,
+    "1d": 24 * 60 * 60,
+    "1w": 7 * 24 * 60 * 60,
+    "14d": 14 * 24 * 60 * 60,
+    "28d": 28 * 24 * 60 * 60,
+}
+
+def parse_user_id(value: str) -> int:
+    if value is None:
+        raise ValueError("no value provided")
+
+    s = str(value).strip()
+    m = re.search(r"(\d{5,25})", s)
+    if not m:
+        raise ValueError(f"could not parse an ID from: {value!r}")
+    try:
+        uid = int(m.group(1))
+    except Exception as exc:
+        raise ValueError("parsed ID is not a valid integer") from exc
+
+    if uid <= 0:
+        raise ValueError("parsed ID is not positive")
+    if uid > 10 ** 30:
+        raise ValueError("parsed ID looks invalid (too large)")
+
+    return uid
+
+class ConfirmKickView(View):
+    def __init__(
+        self,
+        *,
+        invoker: discord.User,
+        target_member: discord.Member,
+        reason: Optional[str],
+        bot: commands.Bot,
+        timeout: float = 60.0,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.invoker = invoker
+        self.target_member = target_member
+        self.reason = reason
+        self.bot = bot
+        self.result: Optional[dict] = None  # filled after confirm/cancel
+
+    async def _disable_all(self, interaction: Optional[Interaction] = None) -> None:
+        # Disable all buttons and attempt to edit the original response to reflect disabled UI
+        for child in self.children:
+            if isinstance(child, Button):
+                child.disabled = True
+        if interaction is not None:
+            try:
+                # edit original response
+                await interaction.edit_original_response(view=self)
+            except Exception:
+                logger.debug("Failed to edit original response while disabling UI", exc_info=True)
+
+    @button(label="Confirm kick", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: Interaction, button_: Button) -> None:
+        # only allow the invoker to confirm
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the user who invoked the command can confirm this action.",
+                ephemeral=True,
+            )
+            return
+
+        # Prevent double-press by disabling UI immediately and editing message
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Performing kick…", view=self)
+        moderator = interaction.user
+        target = self.target_member
+        reason = self.reason or "No reason provided"
+        ts = int(datetime.utcnow().timestamp())
+
+        # Attempt kick - let discord.py raise the correct exceptions and handle them explicitly
+        success = False
+        kick_note = None
+        try:
+            await target.kick(reason=f"{reason} - moderator:{moderator} ({moderator.id})")
+            success = True
+        except discord.Forbidden:
+            success = False
+            kick_note = "Missing permissions or role hierarchy prevents kick (Forbidden)."
+            logger.warning("Kick forbidden: moderator=%s target=%s", moderator, target)
+        except discord.NotFound:
+            success = False
+            kick_note = "Member not found / already left the guild."
+            logger.info("Kick attempted but member not found: %s", target)
+        except discord.HTTPException as exc:
+            success = False
+            kick_note = f"Discord API error during kick: {exc!r}"
+            logger.exception("HTTPException while kicking %s", target)
+        except Exception as exc:
+            success = False
+            kick_note = f"Unexpected error during kick: {exc!r}"
+            logger.exception("Unexpected error while kicking %s", target)
+
+        try:
+             await log_moderation_action(
+                self.bot,
+                action="kick",
+                target_id=target.id,
+                target_name=str(target),
+                moderator_id=moderator.id,
+                moderator_name=str(moderator),
+                reason=reason,
+                success=success,
+                note=kick_note,
+                timestamp=ts,
+            )
+        except Exception as exc:
+            # If the logging helper itself fails, record that for the moderator message
+            logger.exception("log_moderation_action failed unexpectedly")
+
+        # Build final message to moderator (ephemeral)
+        parts = []
+        if success:
+            parts.append(f"✅ Successfully kicked {target.mention}")
+        else:
+            parts.append(f"❌ Failed to kick {target} - see log for details")
+
+        if kick_note:
+            parts.append(f"Kick: {kick_note} - Please report this to a developer")
+
+        final_content = "\n".join(parts)
+
+        # send follow-up ephemeral to the moderator
+        try:
+            await interaction.followup.send(final_content, ephemeral=True)
+        except Exception:
+            # fallback: try to edit original response
+            try:
+                await interaction.edit_original_response(content=final_content, view=self)
+            except Exception:
+                logger.debug("Failed to send followup or edit original response for kick confirmation", exc_info=True)
+
+        # disable UI permanently
+        await self._disable_all(interaction)
+
+    @button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: Interaction, button_: Button) -> None:
+        # This should not normally occur because the interaction is ephemeral,
+        # but we still guard against unexpected interaction states or client behavior.
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the user who invoked the command can cancel this action.",
+                ephemeral=True,
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Kick cancelled.", view=self)
+        await self._disable_all(interaction)
+
+
+class ConfirmBanView(View):
+    def __init__(
+        self,
+        *,
+        invoker: discord.User,
+        target_member: discord.Member,
+        reason: Optional[str],
+        bot: commands.Bot,
+        timeout: float = 60.0,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.invoker = invoker
+        self.target_member = target_member
+        self.reason = reason
+        self.bot = bot
+        self.result: Optional[dict] = None  # filled after confirm/cancel
+
+    async def _disable_all(self, interaction: Optional[Interaction] = None) -> None:
+        # Disable all buttons and attempt to edit the original response to reflect disabled UI
+        for child in self.children:
+            if isinstance(child, Button):
+                child.disabled = True
+        if interaction is not None:
+            try:
+                # edit original response
+                await interaction.edit_original_response(view=self)
+            except Exception:
+                logger.debug("Failed to edit original response while disabling UI", exc_info=True)
+
+    @button(label="Confirm ban", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: Interaction, button_: Button) -> None:
+        # only allow the invoker to confirm
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the user who invoked the command can confirm this action.",
+                ephemeral=True,
+            )
+            return
+
+        # Prevent double-press by disabling UI immediately and editing message
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Performing ban…", view=self)
+        moderator = interaction.user
+        target = self.target_member
+        reason = self.reason or "No reason provided"
+        ts = int(datetime.utcnow().timestamp())
+
+        # Attempt ban - let discord.py raise the correct exceptions and handle them explicitly
+        success = False
+        ban_note = None
+        try:
+            await target.ban(reason=f"{reason} - moderator:{moderator} ({moderator.id})")
+            success = True
+        except discord.Forbidden:
+            success = False
+            ban_note = "Missing permissions or role hierarchy prevents ban (Forbidden)."
+            logger.warning("Ban forbidden: moderator=%s target=%s", moderator, target)
+        except discord.NotFound:
+            success = False
+            ban_note = "Member not found / already left the guild."
+            logger.info("Ban attempted but member not found: %s", target)
+        except discord.HTTPException as exc:
+            success = False
+            ban_note = f"Discord API error during ban: {exc!r}"
+            logger.exception("HTTPException while kicking %s", target)
+        except Exception as exc:
+            success = False
+            ban_note = f"Unexpected error during ban: {exc!r}"
+            logger.exception("Unexpected error while kicking %s", target)
+
+        try:
+            await log_moderation_action(
+                self.bot,
+                action="ban",
+                target_id=target.id,
+                target_name=str(target),
+                moderator_id=moderator.id,
+                moderator_name=str(moderator),
+                reason=reason,
+                success=success,
+                note=ban_note,
+                timestamp=ts,
+            )
+        except Exception as exc:
+            logger.exception("log_moderation_action failed for ban")
+
+        # Build final message to moderator (ephemeral)
+        parts = []
+        if success:
+            parts.append(f"✅ Successfully banned {target.mention}")
+        else:
+            parts.append(f"❌ Failed to banned {target} - see log for details")
+
+        if ban_note:
+            parts.append(f"Kick: {ban_note} - Please report this to a developer")
+
+        final_content = "\n".join(parts)
+
+        # send follow-up ephemeral to the moderator
+        try:
+            await interaction.followup.send(final_content, ephemeral=True)
+        except Exception:
+            # fallback: try to edit original response
+            try:
+                await interaction.edit_original_response(content=final_content, view=self)
+            except Exception:
+                logger.debug("Failed to send followup or edit original response for kick confirmation", exc_info=True)
+
+        # disable UI permanently
+        await self._disable_all(interaction)
+
+    @button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: Interaction, button_: Button) -> None:
+        # This should not normally occur because the interaction is ephemeral,
+        # but we still guard against unexpected interaction states or client behavior.
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the user who invoked the command can cancel this action.",
+                ephemeral=True,
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Ban cancelled.", view=self)
+        await self._disable_all(interaction)
+
+class ConfirmUnbanView(View):
+    def __init__(
+        self,
+        *,
+        invoker: discord.User,
+        target_user_id: int,
+        reason: Optional[str],
+        bot: commands.Bot,
+        timeout: float = 60.0,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.invoker = invoker
+        self.target_user_id = int(target_user_id)
+        self.reason = reason
+        self.bot = bot
+
+    async def _disable_all(self, interaction: Optional[Interaction] = None) -> None:
+        for child in self.children:
+            if isinstance(child, Button):
+                child.disabled = True
+        if interaction is not None:
+            try:
+                await interaction.edit_original_response(view=self)
+            except Exception:
+                logger.debug("Failed to edit original response while disabling UI (unban)", exc_info=True)
+
+    @button(label="Confirm unban", style=discord.ButtonStyle.primary)
+    async def confirm(self, interaction: Interaction, button_: Button) -> None:
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the user who invoked the command can confirm this action.",
+                ephemeral=True,
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Performing unban…", view=self)
+
+        moderator = interaction.user
+        user_id = int(self.target_user_id)
+        reason = self.reason or "No reason provided"
+        ts = int(datetime.utcnow().timestamp())
+        guild = interaction.guild
+
+        target_name = f"User {user_id}"
+        try:
+            fetched_user = await self.bot.fetch_user(user_id)
+            target_name = f"{fetched_user} ({user_id})"
+        except Exception:
+            logger.debug("Could not fetch user %s for nicer display", user_id, exc_info=True)
+
+        success = False
+        unban_note: Optional[str] = None
+        ban_check_error: Optional[str] = None
+        ban_entry = None
+
+        try:
+            try:
+                ban_entry = await guild.fetch_ban(discord.Object(id=user_id))
+            except TypeError:
+                bans = await guild.bans()
+                found = None
+                for b in bans:
+                    cand = getattr(b, "user", None)
+                    if cand is None:
+                        try:
+                            cand_id = int(b)
+                        except Exception:
+                            continue
+                    else:
+                        cand_id = getattr(cand, "id", None)
+                        if cand_id is None:
+                            try:
+                                cand_id = int(cand)
+                            except Exception:
+                                continue
+                    if cand_id == user_id:
+                        found = b
+                        break
+                ban_entry = found
+            except discord.NotFound:
+                ban_entry = None
+        except discord.Forbidden:
+            ban_entry = None
+            ban_check_error = "Missing permission to read ban list (Forbidden)."
+            logger.warning("fetch_ban forbidden: guild=%s moderator=%s", getattr(guild, "id", None), moderator)
+        except Exception as exc:
+            ban_entry = None
+            ban_check_error = f"Error checking ban status: {exc!r}"
+            logger.exception("Error while checking ban status for %s", user_id)
+
+        if ban_entry is None and ban_check_error is None:
+            success = False
+            unban_note = "User is not banned."
+            logger.info("Unban attempted for user not banned: %s", user_id)
+        else:
+            try:
+                await guild.unban(discord.Object(id=user_id), reason=f"{reason} - moderator:{moderator} ({moderator.id})")
+                success = True
+            except discord.Forbidden:
+                success = False
+                unban_note = "Missing permissions to unban (Forbidden)."
+                logger.warning("Unban forbidden: moderator=%s target=%s", moderator, user_id)
+            except discord.NotFound:
+                success = False
+                unban_note = "User not found in ban list (maybe already unbanned)."
+                logger.info("Unban: NotFound for %s", user_id)
+            except discord.HTTPException as exc:
+                success = False
+                unban_note = f"Discord API error during unban: {exc!r}"
+                logger.exception("HTTPException while unbanning %s", user_id)
+            except Exception as exc:
+                success = False
+                unban_note = f"Unexpected error during unban: {exc!r}"
+                logger.exception("Unexpected error while unbanning %s", user_id)
+
+        notes = []
+        if ban_check_error:
+            notes.append(f"Ban-check: {ban_check_error}")
+        if unban_note:
+            notes.append(f"Unban: {unban_note}")
+        action_note = "; ".join(notes) if notes else None
+
+        try:
+            await log_moderation_action(
+                self.bot,
+                action="unban",
+                target_id=user_id,
+                target_name=target_name,
+                moderator_id=moderator.id,
+                moderator_name=str(moderator),
+                reason=reason,
+                success=success,
+                note=action_note,
+                timestamp=ts,
+            )
+        except Exception:
+            logger.exception("log_moderation_action failed for unban")
+
+        parts = []
+        if success:
+            parts.append(f"✅ Successfully unbanned {target_name}")
+        else:
+            parts.append(f"❌ Failed to unban {target_name} - see log for details")
+        if action_note:
+            parts.append(action_note)
+
+        final_content = "\n".join(parts)
+
+        try:
+            await interaction.followup.send(final_content, ephemeral=True)
+        except Exception:
+            try:
+                await interaction.edit_original_response(content=final_content, view=self)
+            except Exception:
+                logger.debug("Failed to send followup or edit original response for unban confirmation", exc_info=True)
+
+        await self._disable_all(interaction)
+
+    @button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: Interaction, button_: Button) -> None:
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the user who invoked the command can cancel this action.",
+                ephemeral=True,
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Unban cancelled.", view=self)
+        await self._disable_all(interaction)
+
+class ConfirmTimeoutView(View):
+    def __init__(
+        self,
+        *,
+        invoker: discord.User,
+        target_member: discord.Member,
+        seconds: int,
+        reason: Optional[str],
+        bot: commands.Bot,
+        timeout: float = 60.0,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.invoker = invoker
+        self.target_member = target_member
+        self.seconds = seconds
+        self.reason = reason
+        self.bot = bot
+        self.result: Optional[dict] = None  # filled after confirm/cancel
+
+    async def _disable_all(self, interaction: Optional[Interaction] = None) -> None:
+        # Disable all buttons and attempt to edit the original response to reflect disabled UI
+        for child in self.children:
+            if isinstance(child, Button):
+                child.disabled = True
+        if interaction is not None:
+            try:
+                # edit original response
+                await interaction.edit_original_response(view=self)
+            except Exception:
+                logger.debug("Failed to edit original response while disabling UI", exc_info=True)
+
+    @button(label="Confirm timeout", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: Interaction, button_: Button) -> None:
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the user who invoked the command can confirm this action.",
+                ephemeral=True,
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Applying timeout...",view=self)
+
+        moderator = interaction.user
+        target = self.target_member
+        seconds = int(self.seconds)
+        until = datetime.utcnow() + timedelta(seconds=seconds)
+        ts = int(datetime.utcnow().timestamp())
+
+        success = False
+        note: Optional[str] = None
+
+        try:
+            await target.timeout(timedelta(seconds=seconds), reason=f"{self.reason} - moderator:{moderator} ({moderator.id})")
+            success = True
+        except discord.Forbidden:
+            success = False
+            note = "Missing permissions or role hierarchy prevents timeout (Forbidden)."
+            logger.warning("Timeout forbidden: moderator=%s target=%s", moderator, target)
+        except discord.NotFound:
+            success = False
+            note = "Member not found (may have left)."
+            logger.info("Timeout attempted but member not found: %s", target)
+        except discord.HTTPException as exc:
+            success = False
+            note = f"Discord API error during timeout: {exc!r}"
+            logger.exception("HTTPException while applying timeout to %s", target)
+        except Exception as exc:
+            success = False
+            note = f"Unexpected error during timeout: {exc!r}"
+            logger.exception("Unexpected error while applying timeout to %s", target)
+
+        try:
+             await log_moderation_action(
+                self.bot,
+                action="timeout",
+                target_id=target.id if hasattr(target, "id") else None,
+                target_name=str(target),
+                moderator_id=moderator.id,
+                moderator_name=str(moderator),
+                reason=self.reason,
+                success=success,
+                note=f"Until = {until.replace(microsecond=0).isoformat()}" + (f"; {note}" if note else ""),
+                timestamp=ts,
+            )
+        except Exception:
+            logger.exception("log_moderation_action failed for timeout")
+
+        parts = []
+        if success:
+            parts.append(f"✅ Timed out {target.mention} until {until.replace(microsecond=0).isoformat()} (UTC)")
+        else:
+            parts.append(f"❌ Failed to timeout {target} - see log for details")
+
+        if note:
+            parts.append(f"Timeout: {note}")
+
+        final_content = "\n".join(parts)
+
+        try:
+            await interaction.followup.send(final_content, ephemeral=True)
+        except Exception:
+            try:
+                await interaction.edit_original_response(content=final_content, view=self)
+            except Exception:
+                logger.debug("Failed to send followup or edit original response for timeout confirmation", exc_info=True)
+
+        await self._disable_all(interaction)
+
+    @button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: Interaction, button_: Button) -> None:
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message("Only the user who invoked the command can cancel this action.", ephemeral=True)
+            return
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Timeout cancelled.", view=self)
+        await self._disable_all(interaction)
+
+
+class ConfirmUntimeoutView(View):
+    def __init__(
+        self,
+        *,
+        invoker: discord.User,
+        target_member: discord.Member,
+        reason: Optional[str],
+        bot: commands.Bot,
+        timeout: float = 60.0,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.invoker = invoker
+        self.target_member = target_member
+        self.reason = reason or "No reason provided"
+        self.bot = bot
+
+    async def _disable_all(self, interaction: Optional[Interaction] = None) -> None:
+        for child in self.children:
+            if isinstance(child, Button):
+                child.disabled = True
+        if interaction is not None:
+            try:
+                await interaction.edit_original_response(view=self)
+            except Exception:
+                logger.debug("Failed to edit original response while disabling UI (untimeout)", exc_info=True)
+
+    @button(label="Confirm remove timeout", style=discord.ButtonStyle.primary)
+    async def confirm(self, interaction: Interaction, button_: Button) -> None:
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message("Only the user who invoked the command can confirm this action.", ephemeral=True)
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Removing timeout…", view=self)
+
+        moderator = interaction.user
+        target = self.target_member
+        reason = self.reason
+        ts = int(datetime.utcnow().timestamp())
+
+        success = False
+        note: Optional[str] = None
+
+
+        try:
+            await target.edit(timed_out_until=None, reason=f"{reason} - moderator:{moderator} ({moderator.id})")
+            success = True
+            note = None
+        except discord.Forbidden:
+            success = False
+            note = "Missing permissions or role hierarchy prevents removing timeout (Forbidden)."
+            logger.warning("Untimeout forbidden: moderator=%s target=%s", moderator, target)
+        except discord.NotFound:
+            success = False
+            note = "Member not found (may have left)."
+            logger.info("Untimeout attempted but member not found: %s", target)
+        except discord.HTTPException as exc:
+            success = False
+            note = f"Discord API error during remove timeout: {exc!r}"
+            logger.exception("HTTPException while removing timeout from %s", target)
+
+        except Exception as exc:
+            success = False
+            note = f"Unexpected error during remove timeout: {exc!r}"
+            logger.exception("Unexpected error while removing timeout from %s", target)
+
+
+        try:
+             await log_moderation_action(
+                self.bot,
+                action="untimeout",
+                target_id=getattr(target, "id", None),
+                target_name=str(target),
+                moderator_id=moderator.id,
+                moderator_name=str(moderator),
+                reason=reason,
+                success=success,
+                note=(f"removed timeout" + (f"; {note}" if note else "")) if success or note else None,
+                timestamp=ts,
+            )
+        except Exception:
+            logger.exception("log_moderation_action failed for untimeout")
+            modlog_result = None
+
+        parts = []
+        if success:
+            parts.append(f"✅ Removed timeout from {target.mention}")
+        else:
+            parts.append(f"❌ Failed to remove timeout from {target} - see log for details")
+
+        if note:
+            parts.append(f"Untimeout: {note}")
+
+        final_content = "\n".join(parts)
+
+        try:
+            await interaction.followup.send(final_content, ephemeral=True)
+        except Exception:
+            try:
+                await interaction.edit_original_response(content=final_content, view=self)
+            except Exception:
+                logger.debug("Failed to send followup or edit original response for untimeout confirmation", exc_info=True)
+
+        await self._disable_all(interaction)
+
+    @button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: Interaction, button_: Button) -> None:
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message("Only the user who invoked the command can cancel this action.", ephemeral=True)
+            return
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Remove timeout cancelled.", view=self)
+        await self._disable_all(interaction)
+
+class ModerationCog(commands.Cog):
+    channel = app_commands.Group(name="channel", description="Channel moderation actions")
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+
+
+    def _is_moderator(self, interaction: Interaction) -> bool:
+        # prefer a configured mod role; fallback to guild perm kick_members
+        settings = getattr(self.bot, "settings", None)
+        mod_role_id = getattr(settings, "mod_role_id", None) if settings else None
+        if mod_role_id:
+            role = interaction.guild.get_role(mod_role_id)
+            return role in interaction.user.roles if role else False
+        # fallback
+        return interaction.user.guild_permissions.kick_members
+
+    @app_commands.command(
+        name="kick",
+        description="Kick a member (requires moderator role or Kick Members permission)."
+    )
+    @app_commands.describe(member="Member to kick", reason="Reason for the kick (optional)")
+    async def kick(
+        self,
+        interaction: Interaction,
+        member: discord.Member,
+        reason: Optional[str] = None,
+    ) -> None:
+        # Basic checks
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a guild.", ephemeral=True)
+            return
+
+        if not self._is_moderator(interaction):
+            await interaction.response.send_message("You do not have permission to run this command.", ephemeral=True)
+            return
+
+        # Prevent self-kick and bot-kick
+        if member.id == interaction.user.id:
+            await interaction.response.send_message("You cannot kick yourself.", ephemeral=True)
+            return
+        if member.id == self.bot.user.id:
+            await interaction.response.send_message("I cannot kick myself.", ephemeral=True)
+            return
+
+        # Role hierarchy check
+        try:
+            invoker_member = interaction.guild.get_member(interaction.user.id)
+            if invoker_member is None:
+                invoker_member = await interaction.guild.fetch_member(interaction.user.id)
+            # allow guild owner to bypass role ordering checks
+            if (
+                member.top_role >= invoker_member.top_role
+                and interaction.user.id != interaction.guild.owner_id
+            ):
+                await interaction.response.send_message(
+                    "You cannot kick a member with an equal or higher role than you.", ephemeral=True
+                )
+                return
+        except Exception:
+            # If role check fails for some reason, continue but log it
+            logger.exception("Failed to check role hierarchy while attempting to kick %s", member)
+
+        # Ask for confirmation via button UI (ephemeral)
+        view = ConfirmKickView(invoker=interaction.user, target_member=member, reason=reason, bot=self.bot)
+        await interaction.response.send_message(
+            f"Confirm kicking {member.mention}? This action is irreversible.", view=view, ephemeral=True
+        )
+
+    @app_commands.command(
+        name="ban",
+        description="Ban a member (requires moderator role or Ban Members permission)."
+    )
+    @app_commands.describe(member="Member to ban", reason="Reason for the ban (optional)")
+    async def ban(
+        self,
+        interaction: Interaction,
+        member: discord.Member,
+        reason: Optional[str] = None,
+    ) -> None:
+        # Basic checks
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a guild.", ephemeral=True)
+            return
+
+
+        if not self._is_moderator(interaction):
+            await interaction.response.send_message("You do not have permission to run this command.", ephemeral=True)
+            return
+
+        # Prevent self-ban and bot-ban
+        if member.id == interaction.user.id:
+            await interaction.response.send_message("You cannot ban yourself.", ephemeral=True)
+            return
+        if member.id == self.bot.user.id:
+            await interaction.response.send_message("I cannot ban myself.", ephemeral=True)
+            return
+
+        # Role hierarchy check
+        try:
+            invoker_member = interaction.guild.get_member(interaction.user.id)
+            if invoker_member is None:
+                invoker_member = await interaction.guild.fetch_member(interaction.user.id)
+            # allow guild owner to bypass role ordering checks
+            if (
+                member.top_role >= invoker_member.top_role
+                and interaction.user.id != interaction.guild.owner_id
+            ):
+                await interaction.response.send_message(
+                    "You cannot ban a member with an equal or higher role than you.", ephemeral=True
+                )
+                return
+        except Exception:
+            # If role check fails for some reason, continue but log it
+            logger.exception("Failed to check role hierarchy while attempting to ban %s", member)
+
+        # Ask for confirmation via button UI
+        view = ConfirmBanView(invoker=interaction.user, target_member=member, reason=reason, bot=self.bot)
+        await interaction.response.send_message(
+            f"Confirm banning {member.mention}? This action is irreversible.", view=view, ephemeral=True
+        )
+
+    @app_commands.command(
+        name="unban",
+        description="Unban a user by user ID or mention (requires moderator role or Ban Members permission)."
+    )
+    @app_commands.describe(user_id="User ID or mention to unban (e.g. 123456789012345678 or <@123...>)", reason="Reason for the unban (optional)")
+    async def unban(
+        self,
+        interaction: Interaction,
+        user_id: str,
+        reason: Optional[str] = None,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a guild.", ephemeral=True)
+            return
+
+        try:
+            uid = parse_user_id(user_id)
+        except ValueError:
+            await interaction.response.send_message(
+                "Please provide a valid user ID or mention (e.g. `123456789012345678` or `<@123...>`).",
+                ephemeral=True,
+            )
+            return
+
+        if not self._is_moderator(interaction):
+            await interaction.response.send_message("You do not have permission to run this command.", ephemeral=True)
+            return
+
+        # Prevent nonsense self/unban bot checks
+        if uid == interaction.user.id:
+            await interaction.response.send_message("You cannot unban yourself.", ephemeral=True)
+            return
+        if uid == self.bot.user.id:
+            await interaction.response.send_message("I cannot unban myself.", ephemeral=True)
+            return
+
+        view = ConfirmUnbanView(invoker=interaction.user, target_user_id=uid, reason=reason, bot=self.bot)
+        await interaction.response.send_message(
+            f"Confirm unbanning user id `{uid}`? This action is irreversible.", view=view, ephemeral=True
+        )
+
+    @app_commands.command(
+        name="timeout",
+        description="Apply timeout to a member (requires moderator role or Moderate Members permission)."
+    )
+    @app_commands.choices(duration=TIMEOUT_CHOICES)
+    @app_commands.describe(member="Member to timeout", duration="Choose a timeout duration", reason="Reason for the timeout (optional")
+    async def timeout(
+        self,
+        interaction: Interaction,
+        member: discord.Member,
+        duration: app_commands.Choice[str],
+        reason: Optional[str] = None) -> None:
+
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a guild.", ephemeral=True)
+            return
+
+        if not self._is_moderator(interaction):
+            await interaction.response.send_message("You do not have permission to run this command.", ephemeral=True)
+            return
+
+        # Prevent self-ban and bot-ban
+        if member.id == interaction.user.id:
+            await interaction.response.send_message("You cannot timeout yourself.", ephemeral=True)
+            return
+        if member.id == self.bot.user.id:
+            await interaction.response.send_message("I cannot timeout myself.", ephemeral=True)
+            return
+
+        # Role hierarchy check
+        try:
+            invoker_member = interaction.guild.get_member(interaction.user.id)
+            if invoker_member is None:
+                invoker_member = await interaction.guild.fetch_member(interaction.user.id)
+            # allow guild owner to bypass role ordering checks
+            if (
+                member.top_role >= invoker_member.top_role
+                and interaction.user.id != interaction.guild.owner_id
+            ):
+                await interaction.response.send_message(
+                    "You cannot timeout a member with an equal or higher role than you.", ephemeral=True
+                )
+                return
+        except Exception:
+            # If role check fails for some reason, continue but log it
+            logger.exception("Failed to check role hierarchy while attempting to timeout %s", member)
+
+        sec = _DURATION_MAP.get(duration.value, None)
+
+        if sec is None:
+            await interaction.response.send_message("Invalid duration choice.", ephemeral=True)
+            return
+
+        view = ConfirmTimeoutView(invoker=interaction.user, target_member=member, seconds=sec, reason=reason, bot=self.bot)
+        await interaction.response.send_message(f"Confirm applying a timeout to {member.mention} for {duration.name}?", view=view, ephemeral=True)
+
+
+    @app_commands.command(
+        name="untimeout",
+        description="Remove a member's communication timeout (requires moderator role or Moderate Members permission)."
+    )
+    @app_commands.describe(member="Member to remove timeout from", reason="Reason (optional)")
+    async def untimeout(
+        self,
+        interaction: Interaction,
+        member: discord.Member,
+        reason: Optional[str] = None,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a guild.", ephemeral=True)
+            return
+
+        if not self._is_moderator(interaction):
+            await interaction.response.send_message("You do not have permission to run this command.", ephemeral=True)
+            return
+
+        if member.id == interaction.user.id:
+            await interaction.response.send_message("You cannot remove your own timeout.", ephemeral=True)
+            return
+        if member.id == self.bot.user.id:
+            await interaction.response.send_message("I cannot remove my own timeout.", ephemeral=True)
+            return
+
+        if member.timed_out_until is None:
+            await interaction.response.send_message(
+                f"❌ {member.mention} is not currently timed out!",
+                ephemeral=True
+            )
+            return
+
+        view = ConfirmUntimeoutView(invoker=interaction.user, target_member=member, reason=reason, bot=self.bot)
+        await interaction.response.send_message(f"Confirm removing timeout from {member.mention}?", view=view, ephemeral=True)
+
+    @channel.command(name="lock", description="Lock a text channel (disables @everyone send messages).")
+    @app_commands.describe(channel="Channel to lock", reason="Reason for the lock (optional)")
+    async def lock(
+        self,
+        interaction: Interaction,
+        channel: Optional[TextChannel] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command must be used in a guild", ephemeral=True)
+            return
+
+        if not self._is_moderator(interaction):
+            await interaction.response.send_message("You do not have permission to run this command.", ephemeral=True)
+            return
+
+        target = channel or (interaction.channel if isinstance(interaction.channel, TextChannel) else None)
+
+        if target is None:
+            await interaction.response.send_message("Please specify a text channel.", ephemeral=True)
+            return
+
+        if not target.permissions_for(interaction.guild.me).manage_channels:
+            await interaction.response.send_message("I don't have Manage Channels permission for that channel.", ephemeral=True)
+            return
+
+        ts = int(datetime.utcnow().timestamp())
+
+        success = False
+        note: Optional[str] = None
+        try:
+            await channel.set_permissions(channel.guild.default_role, send_messages=False)
+            success = True
+        except discord.Forbidden:
+            note = "Missing permissions to edit channel overwrites (Forbidden)."
+            logger.warning("Lock forbidden: %s %s", interaction.user, target)
+        except discord.HTTPException as exc:
+            note = f"Discord API error white locking channel: {exc!r}"
+            logger.exception("HTTPException while locking channel %s", target)
+
+        try:
+            await log_moderation_action(
+                self.bot,
+                action="channel_lock",
+                target_id=target.id,
+                target_name=str(target),
+                moderator_id=interaction.user.id,
+                moderator_name=str(interaction.user),
+                reason=reason or "No reason provided",
+                success=success,
+                note=note,
+                timestamp=ts,
+            )
+        except Exception:
+            logger.exception("log_moderation_action failed for channel lock")
+
+        parts = []
+        if success:
+            parts.append(f"✅ Locked {target.mention}")
+        else:
+            parts.append(f"❌ Failed to lock {target} - see log for details")
+        if note:
+            parts.append(f"Note: {note}")
+
+        message = "\n".join(parts)
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=True)
+
+    @channel.command(name="unlock", description="Unlock a text channel (restores @everyone send messages override).")
+    @app_commands.describe(channel="Channel to unlock", reason="Reason for the unlock (optional)")
+    async def unlock(
+        self,
+        interaction: Interaction,
+        channel: Optional[TextChannel] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command must be used in a guild", ephemeral=True)
+            return
+
+        if not self._is_moderator(interaction):
+            await interaction.response.send_message("You do not have permission to run this command.", ephemeral=True)
+            return
+
+        target = channel or (interaction.channel if isinstance(interaction.channel, TextChannel) else None)
+
+        if target is None:
+            await interaction.response.send_message("Please specify a text channel.", ephemeral=True)
+            return
+
+        if not target.permissions_for(interaction.guild.me).manage_channels:
+            await interaction.response.send_message("I don't have Manage Channels permission for that channel.", ephemeral=True)
+            return
+
+        ts = int(datetime.utcnow().timestamp())
+
+        success = False
+        note: Optional[str] = None
+        try:
+            await channel.set_permissions(channel.guild.default_role, send_messages=True)
+            success = True
+        except discord.Forbidden:
+            note = "Missing permissions to edit channel overwrites (Forbidden)."
+            logger.warning("Unlock forbidden: %s %s", interaction.user, target)
+        except discord.HTTPException as exc:
+            note = f"Discord API error white unlocking channel: {exc!r}"
+            logger.exception("HTTPException while unlocking channel %s", target)
+
+        try:
+            await log_moderation_action(
+                self.bot,
+                action="channel_unlock",
+                target_id=target.id,
+                target_name=str(target),
+                moderator_id=interaction.user.id,
+                moderator_name=str(interaction.user),
+                reason=reason or "No reason provided",
+                success=success,
+                note=note,
+                timestamp=ts,
+            )
+        except Exception:
+            logger.exception("log_moderation_action failed for channel unlock")
+
+        parts = []
+        if success:
+            parts.append(f"✅ Unlocked {target.mention}")
+        else:
+            parts.append(f"❌ Failed to unlock {target} - see log for details")
+        if note:
+            parts.append(f"Note: {note}")
+
+        message = "\n".join(parts)
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=True)
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(ModerationCog(bot))
