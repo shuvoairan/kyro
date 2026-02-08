@@ -4,20 +4,11 @@ from __future__ import annotations
 import aiosqlite
 import logging
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, List
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SCHEMA = """
-CREATE TABLE IF NOT EXISTS guild_members (
-    user_id INTEGER PRIMARY KEY,
-    username TEXT NOT NULL,
-    nickname TEXT,
-    first_joined_at INTEGER NOT NULL,
-    last_joined_at INTEGER NOT NULL,
-    left_at INTEGER
-);
-    
 CREATE TABLE IF NOT EXISTS moderation_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     action TEXT NOT NULL,
@@ -30,12 +21,6 @@ CREATE TABLE IF NOT EXISTS moderation_logs (
     success INTEGER NOT NULL,
     note TEXT
 );
-"""
-
-_INSERT_MOD_LOG_SQL = """
-INSERT INTO moderation_logs
-(action, target_id, target_name, moderator_id, moderator_name, reason, timestamp, success, note)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 

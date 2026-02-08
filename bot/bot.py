@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import importlib
 import logging
 from pathlib import Path
-from typing import Iterable
 
 from discord import Intents, Object
 from discord.ext import commands
@@ -46,7 +44,7 @@ class MyBot(commands.Bot):
         await self.db.connect()
         await self.db.bootstrap()
 
-        # Load cogs
+        # Load cogs from bot/cogs/*.py
         if COGS_PATH.is_dir():
             for file in sorted(COGS_PATH.glob("*.py")):
                 if file.name == "__init__.py":
@@ -59,7 +57,7 @@ class MyBot(commands.Bot):
                 except Exception:
                     logger.exception("Failed to load extension %s", module_path)
 
-        # -------- Load selected cog subpackages (e.g. bot/cogs/mod/*.py) ----------
+        # -------- Load selected cog subpackages (e.g. bot/cogs/mods/*.py) ----------
         cog_packages = getattr(settings, "cog_packages", None) or DEFAULT_COG_PACKAGES
         if not isinstance(cog_packages, (list, tuple)):
             logger.warning("cog_packages setting is not iterable; ignoring")
@@ -120,7 +118,7 @@ def create_bot(settings: Settings | None = None) -> MyBot:
 
 
 def run_bot(settings: Settings | None = None) -> None:
-    setings = settings or Settings()
+    settings = settings or Settings()
     if not settings.token:
         raise RuntimeError("TOKEN is not set in environment (.env)")
 
