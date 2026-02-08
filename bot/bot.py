@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 COGS_PATH = Path(__file__).parent / "cogs"
 
-DEFAULT_COG_PACKAGES = ["mods"]
+DEFAULT_COG_PACKAGES = ["mods", "user"]
 
 
 class MyBot(commands.Bot):
