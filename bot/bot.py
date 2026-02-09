@@ -111,6 +111,8 @@ def create_bot(settings: Settings | None = None) -> MyBot:
     intents.guilds = True
     intents.messages = True
     intents.message_content = True
+    intents.members = True
+    intents.presences = True
 
     bot = MyBot(intents=intents)
     bot.settings = settings
