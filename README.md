@@ -7,7 +7,7 @@ erDiagram
         int first_joined_at
         int last_joined_at
         int left_at
-        boolean is_active
+        boolean is_afk
     }
 
     moderation_log {
