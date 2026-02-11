@@ -209,5 +209,67 @@ class UserCommandCog(commands.Cog):
                 logger.debug("Could not send fallback ephemeral message for userinfo", exc_info=True)
 
 
+    @app_commands.command(name="roles", description="Display a user's roles in detail")
+    @app_commands.describe(user="User to display roles for (defaults to you)")
+    async def roles(
+        self,
+        interaction: Interaction,
+        user: Optional[discord.User] = None,
+    ) -> None:
+        target: discord.abc.User = user or interaction.user
+
+        member: Optional[discord.Member] = None
+
+        if interaction.guild is not None:
+            try:
+                member = interaction.guild.get_member(target.id) or await interaction.guild.fetch_member(target.id)
+            except Exception:
+                member = None
+
+        roles = [r for r in member.roles if r != interaction.guild.default_role]
+
+        roles.sort(key=lambda r: r.position, reverse=True)
+
+        role_count = len(roles)
+        top_role = member.top_role if getattr(member, "top_role", None) else None
+
+        lines = []
+        for r in roles:
+            try:
+                hex_color = f"#{(r.color.value & 0xFFFFF):06x}"
+            except Exception:
+                hex_color = "default"
+
+            lines.append(f"{r.mention} - color: {hex_color}")
+
+        hierarchy = " ".join(r.mention for r in roles)
+
+        def truncate_field(s: str, limit: int = 1000) -> str:
+            if len(s) <= limit:
+                return s
+
+            # keep a bit of margin and append indicator
+            return s[: (limit - 50)].rsplit("\n", 1)[0] + f"\n... (truncated, {len(s) - (limit-50)} more chars)"
+
+        roles_detail = "\n".join(lines) if lines else "No roles (only @everyone)"
+        roles_detail = truncate_field(roles_detail, limit=1000)
+
+        embed = discord.Embed(
+            title=f"Roles - {getattr(target, 'display_name', getattr(target, 'name', str(target)))}",
+            color=(top_role.color if top_role is not None else discord.Color.blurple()),
+        )
+
+        embed.add_field(name="Top role", value=(top_role.mention if top_role and top_role != interaction.guild.default_role else "None"), inline=True)
+        embed.add_field(name="Role count", value=str(role_count), inline=True)
+        embed.add_field(name="Roles", value=roles_detail, inline=False)
+        try:
+            await interaction.response.send_message(embed=embed)
+        except Exception:
+            logger.exception("Failed to send roles info for %s", target)
+            try:
+                await interaction.response.send_message("Failed to fetch roles - check bot permissions or logs.", ephemeral=True)
+            except Exception:
+                logger.debug("Could not send fallback ephemeral message for roles command", exc_info=True)
+
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(UserCommandCog(bot))
