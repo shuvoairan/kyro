@@ -21,6 +21,16 @@ CREATE TABLE IF NOT EXISTS moderation_logs (
     success INTEGER NOT NULL,
     note TEXT
 );
+    
+CREATE TABLE IF NOT EXISTS guild_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    nickname TEXT NOT NULL,
+    first_joined_at INTEGER NOT NULL,
+    last_joined_at INTEGER NOT NULL,
+    left_at INTEGER NOT NULL,
+    is_afk INTEGER NOT NULL DEFAULT 0,
+);
 """
 
 
