@@ -1,11 +1,23 @@
 ```mermaid
 erDiagram
     guild_members {
-        bigint user_id
-        text username
-        text nickname
-        timestamp first_joined_at
-        timestamp last_joined_at
-        timestamp left_at
+        int id
+        string username
+        string nickname
+        int first_joined_at
+        int last_joined_at
+        int left_at
+        boolean is_active
+    }
+
+    moderation_log {
+        int id
+        string action
+        int target_id
+        int moderator_id
+        string reason
+        int created_at
+        boolean success
+        string note
     }
 ```
