@@ -1,4 +1,3 @@
-# bot/db.py
 from __future__ import annotations
 
 import aiosqlite
@@ -21,15 +20,20 @@ CREATE TABLE IF NOT EXISTS moderation_logs (
     success INTEGER NOT NULL,
     note TEXT
 );
-    
+
 CREATE TABLE IF NOT EXISTS guild_members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER PRIMARY KEY,
     username TEXT NOT NULL,
-    nickname TEXT NOT NULL,
+    nickname TEXT,
     first_joined_at INTEGER NOT NULL,
     last_joined_at INTEGER NOT NULL,
-    left_at INTEGER NOT NULL,
-    is_afk INTEGER NOT NULL DEFAULT 0,
+    left_at INTEGER
+);
+    
+CREATE TABLE IF NOT EXISTS afk_statuses (
+    user_id INTEGER PRIMARY KEY,
+    reason TEXT,
+    since INTEGER NOT NULL
 );
 """
 
