@@ -35,6 +35,15 @@ CREATE TABLE IF NOT EXISTS afk_statuses (
     reason TEXT,
     since INTEGER NOT NULL
 );
+    
+CREATE TABLE IF NOT EXISTS confessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content TEXT NOT NULL,
+    category TEXT,
+    timestamp INTEGER NOT NULL,
+    message_id INTEGER,
+    deleted INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
