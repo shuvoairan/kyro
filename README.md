@@ -1,7 +1,7 @@
 ```mermaid
 erDiagram
     guild_members {
-        INTEGER user_id PK
+        INTEGER user_id
         TEXT username
         TEXT nickname
         INTEGER first_joined_at
@@ -10,11 +10,11 @@ erDiagram
     }
 
     moderation_logs {
-        INTEGER id PK
+        INTEGER id
         TEXT action
-        INTEGER target_id FK
+        INTEGER target_id
         TEXT target_name
-        INTEGER moderator_id FK
+        INTEGER moderator_id
         TEXT moderator_name
         TEXT reason
         INTEGER timestamp
@@ -29,7 +29,7 @@ erDiagram
     }
 
     confessions {
-        INTEGER id PK
+        INTEGER id
         TEXT content
         TEXT category
         INTEGER timestamp
